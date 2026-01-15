@@ -159,12 +159,12 @@ const config: ForgeConfig = {
       name: "@electron-forge/publisher-github",
       config: {
         repository: {
-          owner: "dyad-sh",
-          name: "dyad",
+          owner: "LilYoopug",
+          name: "dyadarm64",
         },
-        draft: true,
+        draft: false,
         force: true,
-        prerelease: true,
+        prerelease: false,
       },
     },
   ],
