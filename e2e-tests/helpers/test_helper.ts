@@ -21,6 +21,66 @@ export const Timeout = {
 };
 
 /**
+ * Normalizes item_reference IDs in the input array to be deterministic.
+ * item_reference objects have the shape { type: "item_reference", id: "msg_..." }
+ * where the ID is a timestamp-based value that changes between test runs.
+ */
+function normalizeItemReferences(dump: any): void {
+  const input = dump?.body?.input;
+  if (!Array.isArray(input)) {
+    return;
+  }
+
+  let refIndex = 0;
+  for (const item of input) {
+    if (item?.type === "item_reference" && item?.id) {
+      item.id = `[[ITEM_REF_${refIndex}]]`;
+      refIndex++;
+    }
+  }
+}
+
+/**
+ * Normalizes tool_call IDs and tool_call_id references to be deterministic.
+ * Tool call IDs have the format "call_[timestamp]_[index]" which changes between runs.
+ */
+function normalizeToolCallIds(dump: any): void {
+  const messages = dump?.body?.messages;
+  if (!Array.isArray(messages)) {
+    return;
+  }
+
+  const oldToNewId: Record<string, string> = {};
+  let toolCallIndex = 0;
+
+  // First pass: collect all tool_call IDs and create mapping
+  for (const message of messages) {
+    if (message?.tool_calls && Array.isArray(message.tool_calls)) {
+      for (const toolCall of message.tool_calls) {
+        if (toolCall?.id && !oldToNewId[toolCall.id]) {
+          oldToNewId[toolCall.id] = `[[TOOL_CALL_${toolCallIndex}]]`;
+          toolCallIndex++;
+        }
+      }
+    }
+  }
+
+  // Second pass: replace all IDs
+  for (const message of messages) {
+    if (message?.tool_calls && Array.isArray(message.tool_calls)) {
+      for (const toolCall of message.tool_calls) {
+        if (toolCall?.id && oldToNewId[toolCall.id]) {
+          toolCall.id = oldToNewId[toolCall.id];
+        }
+      }
+    }
+    if (message?.tool_call_id && oldToNewId[message.tool_call_id]) {
+      message.tool_call_id = oldToNewId[message.tool_call_id];
+    }
+  }
+}
+
+/**
  * Normalizes fileId hashes in versioned_files to be deterministic.
  * FileIds are SHA-256 hashes that may include non-deterministic components
  * like app paths with timestamps. This replaces them with stable placeholders
@@ -289,10 +349,12 @@ export class PageObject {
     autoApprove = false,
     disableNativeGit = false,
     enableAutoFixProblems = false,
+    enableBasicAgent = false,
   }: {
     autoApprove?: boolean;
     disableNativeGit?: boolean;
     enableAutoFixProblems?: boolean;
+    enableBasicAgent?: boolean;
   } = {}) {
     await this.baseSetup();
     await this.goToSettingsTab();
@@ -307,8 +369,10 @@ export class PageObject {
     }
     await this.setUpTestProvider();
     await this.setUpTestModel();
-
     await this.goToAppsTab();
+    if (!enableBasicAgent) {
+      await this.selectChatMode("build");
+    }
     await this.selectTestModel();
   }
 
@@ -328,6 +392,9 @@ export class PageObject {
     }
     await this.setUpDyadProvider();
     await this.goToAppsTab();
+    if (!localAgent) {
+      await this.selectChatMode("build");
+    }
     // Select a non-openAI model for local agent mode,
     // since openAI models go to the responses API.
     if (localAgent && !localAgentUseAutoModel) {
@@ -409,18 +476,21 @@ export class PageObject {
     await this.page.getByRole("button", { name: "Import" }).click();
   }
 
-  async selectChatMode(mode: "build" | "ask" | "agent" | "local-agent") {
+  async selectChatMode(
+    mode: "build" | "ask" | "agent" | "local-agent" | "basic-agent",
+  ) {
     await this.page.getByTestId("chat-mode-selector").click();
-    // local-agent appears as "Agent v2" in the UI
-    const optionName =
-      mode === "local-agent"
-        ? "Agent v2"
-        : mode === "agent"
-          ? "Build with MCP"
-          : mode;
+    const mapping: Record<string, string> = {
+      build: "Build Generate and edit code",
+      ask: "Ask Ask",
+      agent: "Build with MCP",
+      "local-agent": "Agent v2",
+      "basic-agent": "Basic Agent", // For free users
+    };
+    const optionName = mapping[mode];
     await this.page
       .getByRole("option", {
-        name: optionName,
+        name: new RegExp(optionName),
       })
       .click();
   }
@@ -670,7 +740,9 @@ export class PageObject {
   async waitForAnnotatorMode() {
     // Wait for the annotator toolbar to be visible
     await expect(this.page.getByRole("button", { name: "Select" })).toBeVisible(
-      { timeout: Timeout.MEDIUM },
+      {
+        timeout: Timeout.MEDIUM,
+      },
     );
   }
 
@@ -762,6 +834,7 @@ export class PageObject {
     type: "all-messages" | "last-message" | "request" = "all-messages",
     { name = "", dumpIndex = -1 }: { name?: string; dumpIndex?: number } = {},
   ) {
+    await this.waitForChatCompletion();
     // Get the text content of the messages list
     const messagesListText = await this.page
       .getByTestId("messages-list")
@@ -830,6 +903,10 @@ export class PageObject {
       }
       // Normalize fileIds to be deterministic based on content
       normalizeVersionedFiles(parsedDump);
+      // Normalize item_reference IDs (e.g., msg_1234567890) to be deterministic
+      normalizeItemReferences(parsedDump);
+      // Normalize tool_call IDs (e.g., call_1234567890_0) to be deterministic
+      normalizeToolCallIds(parsedDump);
       expect(
         JSON.stringify(parsedDump, null, 2).replace(/\\r\\n/g, "\\n"),
       ).toMatchSnapshot(name);
@@ -1057,6 +1134,27 @@ export class PageObject {
       throw new Error("No current app name found");
     }
     return this.getAppPath({ appName: currentAppName });
+  }
+
+  async configureGitUser({
+    email = "test@example.com",
+    name = "Test User",
+    disableGpgSign = true,
+  }: {
+    email?: string;
+    name?: string;
+    disableGpgSign?: boolean;
+  } = {}) {
+    const appPath = await this.getCurrentAppPath();
+    if (!appPath) {
+      throw new Error("App path not found");
+    }
+
+    execSync(`git config user.email '${email}'`, { cwd: appPath });
+    execSync(`git config user.name '${name}'`, { cwd: appPath });
+    if (disableGpgSign) {
+      execSync("git config commit.gpgsign false", { cwd: appPath });
+    }
   }
 
   getAppPath({ appName }: { appName: string }) {

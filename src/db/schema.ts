@@ -97,6 +97,10 @@ export const messages = sqliteTable("messages", {
   aiMessagesJson: text("ai_messages_json", {
     mode: "json",
   }).$type<AiMessagesJsonV6 | null>(),
+  // Track if this message used the free agent quota (for non-Pro users)
+  usingFreeAgentModeQuota: integer("using_free_agent_mode_quota", {
+    mode: "boolean",
+  }),
   createdAt: integer("created_at", { mode: "timestamp" })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -168,7 +172,9 @@ export const language_models = sqliteTable("language_models", {
   builtinProviderId: text("builtin_provider_id"),
   customProviderId: text("custom_provider_id").references(
     () => language_model_providers.id,
-    { onDelete: "cascade" },
+    {
+      onDelete: "cascade",
+    },
   ),
   description: text("description"),
   max_output_tokens: integer("max_output_tokens"),
@@ -218,6 +224,10 @@ export const mcpServers = sqliteTable("mcp_servers", {
     string,
     string
   > | null>(),
+  headersJson: text("headers_json", { mode: "json" }).$type<Record<
+    string,
+    string
+  > | null>(),
   url: text("url"),
   enabled: integer("enabled", { mode: "boolean" })
     .notNull()
@@ -245,3 +255,17 @@ export const mcpToolConsents = sqliteTable(
   },
   (table) => [unique("uniq_mcp_consent").on(table.serverId, table.toolName)],
 );
+
+// --- Custom Themes table ---
+export const customThemes = sqliteTable("custom_themes", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  description: text("description"),
+  prompt: text("prompt").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`(unixepoch())`),
+});

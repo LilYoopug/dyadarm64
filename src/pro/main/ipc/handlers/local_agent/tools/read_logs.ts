@@ -4,21 +4,14 @@ import { db } from "@/db";
 import { chats } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { getLogs } from "@/lib/log_store";
-import type { ConsoleEntry } from "@/ipc/ipc_types";
+import type { ConsoleEntry } from "@/ipc/types";
 
 const readLogsSchema = z.object({
   type: z
-    .enum([
-      "all",
-      "client",
-      "server",
-      "edge-function",
-      "network-requests",
-      "build-time",
-    ])
+    .enum(["all", "client", "server", "edge-function", "network-requests"])
     .optional()
     .describe(
-      "Filter by log source type (default: all). Types: 'client' = browser console logs; 'server' = backend/SSR logs; 'edge-function' = edge function logs; 'network-requests' = HTTP requests and responses (outgoing calls and their responses); 'build-time' = build and bundler output.",
+      "Filter by log source type (default: all). Types: 'client' = browser console logs; 'server' = backend (including development server) logs and build output; 'edge-function' = edge function logs; 'network-requests' = HTTP requests and responses (outgoing calls and their responses).",
     ),
 
   level: z

@@ -6,23 +6,18 @@ import { z } from "zod";
 import { IpcMainInvokeEvent } from "electron";
 import { jsonrepair } from "jsonrepair";
 import { AgentToolConsent } from "@/lib/schemas";
-import { AgentTodo } from "@/ipc/ipc_types";
+import { AgentTodo } from "@/ipc/types";
 
 // ============================================================================
 // XML Escape Helpers
 // ============================================================================
 
-export function escapeXmlAttr(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-export function escapeXmlContent(str: string): string {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
+export {
+  escapeXmlAttr,
+  unescapeXmlAttr,
+  escapeXmlContent,
+  unescapeXmlContent,
+} from "../../../../../../../shared/xmlEscape";
 
 // ============================================================================
 // Todo Types
@@ -31,8 +26,24 @@ export function escapeXmlContent(str: string): string {
 // Re-export AgentTodo as Todo for backwards compatibility within this module
 export type Todo = AgentTodo;
 
+/** Tracks which file-editing tools were used on each file path */
+export const FILE_EDIT_TOOL_NAMES = [
+  "write_file",
+  "edit_file",
+  "search_replace",
+] as const;
+export type FileEditToolName = (typeof FILE_EDIT_TOOL_NAMES)[number];
+export interface FileEditTracker {
+  [filePath: string]: {
+    write_file: number;
+    edit_file: number;
+    search_replace: number;
+  };
+}
+
 export interface AgentContext {
   event: IpcMainInvokeEvent;
+  appId: number;
   appPath: string;
   chatId: number;
   supabaseProjectId: string | null;
@@ -44,6 +55,13 @@ export interface AgentContext {
   todos: Todo[];
   /** Request ID for tracking requests to the Dyad engine */
   dyadRequestId: string;
+  /** Tracks file edit tool usage per file for telemetry */
+  fileEditTracker: FileEditTracker;
+  /**
+   * If true, this is Basic Agent mode (free tier with quota).
+   * Engine-dependent tools are disabled in this mode.
+   */
+  isBasicAgentMode: boolean;
   /**
    * Streams accumulated XML to UI without persisting to DB (for live preview).
    * Call this repeatedly with the full accumulated XML so far.
@@ -122,6 +140,11 @@ export interface ToolDefinition<T = any> {
   readonly description: string;
   readonly inputSchema: z.ZodType<T>;
   readonly defaultConsent: AgentToolConsent;
+  /**
+   * If true, this tool modifies state (files, database, etc.).
+   * Used to filter out state-modifying tools in read-only mode (e.g., ask mode).
+   */
+  readonly modifiesState?: boolean;
   execute: (args: T, ctx: AgentContext) => Promise<ToolResult>;
 
   /**

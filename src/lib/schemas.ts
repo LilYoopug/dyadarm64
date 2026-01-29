@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isOpenAIOrAnthropicSetup } from "./providerUtils";
 
 export const SecretSchema = z.object({
   value: z.string(),
@@ -235,6 +236,9 @@ export type ReleaseChannel = z.infer<typeof ReleaseChannelSchema>;
 export const ZoomLevelSchema = z.enum(["90", "100", "110", "125", "150"]);
 export type ZoomLevel = z.infer<typeof ZoomLevelSchema>;
 
+export const DeviceModeSchema = z.enum(["desktop", "tablet", "mobile"]);
+export type DeviceMode = z.infer<typeof DeviceModeSchema>;
+
 export const SmartContextModeSchema = z.enum([
   "balanced",
   "conservative",
@@ -290,9 +294,12 @@ export const UserSettingsSchema = z
     selectedTemplateId: z.string(),
     selectedThemeId: z.string().optional(),
     enableSupabaseWriteSqlMigration: z.boolean().optional(),
+    skipPruneEdgeFunctions: z.boolean().optional(),
     selectedChatMode: ChatModeSchema.optional(),
+    defaultChatMode: ChatModeSchema.optional(),
     acceptedCommunityCode: z.boolean().optional(),
     zoomLevel: ZoomLevelSchema.optional(),
+    previewDeviceMode: DeviceModeSchema.optional(),
 
     enableAutoFixProblems: z.boolean().optional(),
     enableNativeGit: z.boolean().optional(),
@@ -330,22 +337,75 @@ export function hasDyadProKey(settings: UserSettings): boolean {
   return !!settings.providerSettings?.auto?.apiKey?.value;
 }
 
+/**
+ * Gets the effective default chat mode based on settings, pro status, and free quota availability.
+ * - If defaultChatMode is set and valid for the user's Pro status, use it
+ * - If defaultChatMode is "local-agent" but user doesn't have Pro:
+ *   - If free agent quota available AND OpenAI/Anthropic is set up, use "local-agent" (basic agent mode)
+ *   - Otherwise, fall back to "build"
+ * - If defaultChatMode is NOT set:
+ *   - Pro users: use "local-agent"
+ *   - Non-Pro users with quota AND OpenAI/Anthropic set up: use "local-agent" (basic agent mode)
+ *   - Non-Pro users without quota or provider: use "build"
+ */
+export function getEffectiveDefaultChatMode(
+  settings: UserSettings,
+  envVars: Record<string, string | undefined>,
+  freeAgentQuotaAvailable?: boolean,
+): ChatMode {
+  const isPro = isDyadProEnabled(settings);
+  // We are checking that OpenAI or Anthropic is setup, which are the first two
+  // choices for the Auto model selection.
+  //
+  // If user only has Gemini API key, we don't default to local-agent because
+  // most likely it's a free API key with stringent limits and they'll get
+  // a bad experience with local-agent.
+  const hasPaidProviderSetup = isOpenAIOrAnthropicSetup(settings, envVars);
+
+  if (settings.defaultChatMode) {
+    // "local-agent" requires either Pro OR (available free quota AND provider setup)
+    if (settings.defaultChatMode === "local-agent") {
+      if (isPro) return "local-agent";
+      if (freeAgentQuotaAvailable && hasPaidProviderSetup) return "local-agent";
+      return "build";
+    }
+    return settings.defaultChatMode;
+  }
+
+  // No explicit default set
+  if (isPro) return "local-agent";
+  if (freeAgentQuotaAvailable && hasPaidProviderSetup) return "local-agent";
+  return "build";
+}
+
+/**
+ * Determines if the current session is using Basic Agent mode (free tier with quota).
+ * Basic Agent mode is when:
+ * - User is NOT a Pro subscriber
+ * - User is using local-agent chat mode
+ */
+export function isBasicAgentMode(settings: UserSettings): boolean {
+  return (
+    !isDyadProEnabled(settings) && settings.selectedChatMode === "local-agent"
+  );
+}
+
 export function isSupabaseConnected(settings: UserSettings | null): boolean {
   if (!settings) {
     return false;
   }
   return Boolean(
     settings.supabase?.accessToken ||
-      (settings.supabase?.organizations &&
-        Object.keys(settings.supabase.organizations).length > 0),
+    (settings.supabase?.organizations &&
+      Object.keys(settings.supabase.organizations).length > 0),
   );
 }
 
 export function isTurboEditsV2Enabled(settings: UserSettings): boolean {
   return Boolean(
     isDyadProEnabled(settings) &&
-      settings.enableProLazyEditsMode === true &&
-      settings.proLazyEditsMode === "v2",
+    settings.enableProLazyEditsMode === true &&
+    settings.proLazyEditsMode === "v2",
   );
 }
 

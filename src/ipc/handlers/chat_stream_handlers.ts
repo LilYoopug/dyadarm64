@@ -1,5 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { ipcMain, IpcMainInvokeEvent } from "electron";
+import { createTypedHandler } from "./base";
+import { chatContracts } from "../types/chat";
 import {
   ModelMessage,
   TextPart,
@@ -20,14 +22,14 @@ import {
   constructSystemPrompt,
   readAiRules,
 } from "../../prompts/system_prompt";
-import { getThemePrompt } from "../../shared/themes";
+import { getThemePromptById } from "../utils/theme_utils";
 import {
-  SUPABASE_AVAILABLE_SYSTEM_PROMPT,
+  getSupabaseAvailableSystemPrompt,
   SUPABASE_NOT_AVAILABLE_SYSTEM_PROMPT,
 } from "../../prompts/supabase_prompt";
 import { getDyadAppPath } from "../../paths/paths";
 import { readSettings } from "../../main/settings";
-import type { ChatResponseEnd, ChatStreamParams } from "../ipc_types";
+import type { ChatResponseEnd, ChatStreamParams } from "@/ipc/types";
 import {
   CodebaseFile,
   extractCodebase,
@@ -67,6 +69,7 @@ import { cleanFullResponse } from "../utils/cleanFullResponse";
 import { generateProblemReport } from "../processors/tsc";
 import { createProblemFixPrompt } from "@/shared/problem_prompt";
 import { AsyncVirtualFileSystem } from "../../../shared/VirtualFilesystem";
+import { escapeXmlAttr, escapeXmlContent } from "../../../shared/xmlEscape";
 import {
   getDyadAddDependencyTags,
   getDyadWriteTags,
@@ -82,7 +85,17 @@ import { inArray } from "drizzle-orm";
 import { replacePromptReference } from "../utils/replacePromptReference";
 import { mcpManager } from "../utils/mcp_manager";
 import z from "zod";
-import { isSupabaseConnected, isTurboEditsV2Enabled } from "@/lib/schemas";
+import {
+  isDyadProEnabled,
+  isBasicAgentMode,
+  isSupabaseConnected,
+  isTurboEditsV2Enabled,
+} from "@/lib/schemas";
+import {
+  getFreeAgentQuotaStatus,
+  markMessageAsUsingFreeAgentQuota,
+  unmarkMessageAsUsingFreeAgentQuota,
+} from "./free_agent_quota_handlers";
 import { AI_STREAMING_ERROR_MESSAGE_PREFIX } from "@/shared/texts";
 import { getCurrentCommitHash } from "../utils/git_utils";
 import {
@@ -121,13 +134,7 @@ async function isTextFile(filePath: string): Promise<boolean> {
   return TEXT_FILE_EXTENSIONS.includes(ext);
 }
 
-function escapeXml(unsafe: string): string {
-  return unsafe
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
+// Use escapeXmlAttr from shared/xmlEscape for XML escaping
 
 // Safely parse an MCP tool key that combines server and tool names.
 // We split on the LAST occurrence of "__" to avoid ambiguity if either
@@ -226,10 +233,15 @@ export function registerChatStreamHandlers() {
     let attachmentPaths: string[] = [];
     try {
       const fileUploadsState = FileUploadsState.getInstance();
+      // Clear any stale state from previous requests for this chat
+      fileUploadsState.clear(req.chatId);
       let dyadRequestId: string | undefined;
       // Create an AbortController for this stream
       const abortController = new AbortController();
       activeStreams.set(req.chatId, abortController);
+
+      // Notify renderer that stream is starting
+      safeSend(event.sender, "chat:stream:start", { chatId: req.chatId });
 
       // Get the chat to check for existing messages
       const chat = await db.query.chats.findFirst({
@@ -611,7 +623,7 @@ ${componentSnippet}
         const aiRules = await readAiRules(getDyadAppPath(updatedChat.app.path));
 
         // Get theme prompt for the app (null themeId means "no theme")
-        const themePrompt = getThemePrompt(updatedChat.app.themeId);
+        const themePrompt = await getThemePromptById(updatedChat.app.themeId);
         logger.log(
           `Theme for app ${updatedChat.app.id}: ${updatedChat.app.themeId ?? "none"}, prompt length: ${themePrompt.length} chars`,
         );
@@ -624,6 +636,7 @@ ${componentSnippet}
               : settings.selectedChatMode,
           enableTurboEditsV2: isTurboEditsV2Enabled(settings),
           themePrompt,
+          basicAgentMode: isBasicAgentMode(settings),
         });
 
         // Add information about mentioned apps if any
@@ -661,9 +674,13 @@ ${componentSnippet}
           updatedChat.app?.supabaseProjectId &&
           isSupabaseConnected(settings)
         ) {
+          const supabaseClientCode = await getSupabaseClientCode({
+            projectId: updatedChat.app.supabaseProjectId,
+            organizationSlug: updatedChat.app.supabaseOrganizationSlug ?? null,
+          });
           systemPrompt +=
             "\n\n" +
-            SUPABASE_AVAILABLE_SYSTEM_PROMPT +
+            getSupabaseAvailableSystemPrompt(supabaseClientCode) +
             "\n\n" +
             // For local agent, we will explicitly fetch the database context when needed.
             (settings.selectedChatMode === "local-agent"
@@ -800,7 +817,14 @@ This conversation includes one or more image attachments. When the user uploads 
                 attachmentPaths,
               );
             }
-            if (settings.selectedChatMode === "local-agent") {
+            // Save aiMessagesJson for modes that use handleLocalAgentStream
+            // (which reads from DB and needs structured image content)
+            const willUseLocalAgentStream =
+              settings.selectedChatMode === "local-agent" ||
+              (settings.selectedChatMode === "ask" &&
+                isDyadProEnabled(settings) &&
+                !mentionedAppsCodebases.length);
+            if (willUseLocalAgentStream) {
               // Insert into DB (with size guard)
               const userAiMessagesJson = getAiMessagesJsonIfWithinLimit([
                 chatMessages[lastUserIndex],
@@ -960,20 +984,6 @@ This conversation includes one or more image attachments. When the user uploads 
         }: {
           fullResponse: string;
         }) => {
-          if (
-            fullResponse.includes("$$SUPABASE_CLIENT_CODE$$") &&
-            updatedChat.app?.supabaseProjectId
-          ) {
-            const supabaseClientCode = await getSupabaseClientCode({
-              projectId: updatedChat.app?.supabaseProjectId,
-              organizationSlug:
-                updatedChat.app?.supabaseOrganizationSlug ?? null,
-            });
-            fullResponse = fullResponse.replace(
-              "$$SUPABASE_CLIENT_CODE$$",
-              supabaseClientCode,
-            );
-          }
           // Store the current partial response
           partialResponses.set(req.chatId, fullResponse);
           // Save to DB (in case user is switching chats during the stream)
@@ -1004,6 +1014,38 @@ This conversation includes one or more image attachments. When the user uploads 
           return fullResponse;
         };
 
+        // Handle pro ask mode: use local-agent in read-only mode
+        // This gives pro users access to code reading tools while in ask mode
+        if (
+          settings.selectedChatMode === "ask" &&
+          isDyadProEnabled(settings) &&
+          !mentionedAppsCodebases.length
+        ) {
+          // Reconstruct system prompt for local-agent read-only mode
+          const readOnlySystemPrompt = constructSystemPrompt({
+            aiRules,
+            chatMode: "local-agent",
+            enableTurboEditsV2: false,
+            themePrompt,
+            readOnly: true,
+          });
+
+          await handleLocalAgentStream(event, req, abortController, {
+            placeholderMessageId: placeholderAssistantMessage.id,
+            // Note: this is using the read-only system prompt rather than the
+            // regular system prompt which gets overrides for special intents
+            // like summarize chat, security review, etc.
+            //
+            // This is OK because those intents should always happen in a new chat
+            // and new chats will default to non-ask modes.
+            systemPrompt: readOnlySystemPrompt,
+            dyadRequestId: dyadRequestId ?? "[no-request-id]",
+            readOnly: true,
+            messageOverride: isSummarizeIntent ? chatMessages : undefined,
+          });
+          return;
+        }
+
         // Handle local-agent mode (Agent v2)
         // Mentioned apps can't be handled by the local agent (defer to balanced smart context
         // in build mode)
@@ -1011,11 +1053,49 @@ This conversation includes one or more image attachments. When the user uploads 
           settings.selectedChatMode === "local-agent" &&
           !mentionedAppsCodebases.length
         ) {
-          await handleLocalAgentStream(event, req, abortController, {
-            placeholderMessageId: placeholderAssistantMessage.id,
-            systemPrompt,
-            dyadRequestId: dyadRequestId ?? "[no-request-id]",
-          });
+          // Check quota for Basic Agent mode (non-Pro users)
+          const isBasicAgentModeRequest = isBasicAgentMode(settings);
+          if (isBasicAgentModeRequest) {
+            const quotaStatus = await getFreeAgentQuotaStatus();
+            if (quotaStatus.isQuotaExceeded) {
+              safeSend(event.sender, "chat:response:error", {
+                chatId: req.chatId,
+                error: JSON.stringify({
+                  type: "FREE_AGENT_QUOTA_EXCEEDED",
+                  hoursUntilReset: quotaStatus.hoursUntilReset,
+                  resetTime: quotaStatus.resetTime,
+                }),
+              });
+              return;
+            }
+          }
+
+          // Mark the user message as using quota BEFORE starting the stream
+          // to prevent race conditions with parallel requests
+          if (isBasicAgentModeRequest && userMessageId) {
+            await markMessageAsUsingFreeAgentQuota(userMessageId);
+          }
+
+          let streamSuccess = false;
+          try {
+            streamSuccess = await handleLocalAgentStream(
+              event,
+              req,
+              abortController,
+              {
+                placeholderMessageId: placeholderAssistantMessage.id,
+                systemPrompt,
+                dyadRequestId: dyadRequestId ?? "[no-request-id]",
+                messageOverride: isSummarizeIntent ? chatMessages : undefined,
+              },
+            );
+          } finally {
+            // If the stream failed, was aborted, or threw, refund the quota
+            if (isBasicAgentModeRequest && userMessageId && !streamSuccess) {
+              await unmarkMessageAsUsingFreeAgentQuota(userMessageId);
+            }
+          }
+
           return;
         }
 
@@ -1248,7 +1328,7 @@ ${formattedSearchReplaceIssues}`,
 ${problemReport.problems
   .map(
     (problem) =>
-      `<problem file="${escapeXml(problem.file)}" line="${problem.line}" column="${problem.column}" code="${problem.code}">${escapeXml(problem.message)}</problem>`,
+      `<problem file="${escapeXmlAttr(problem.file)}" line="${problem.line}" column="${problem.column}" code="${problem.code}">${escapeXmlContent(problem.message)}</problem>`,
   )
   .join("\n")}
 </dyad-problem-report>`;
@@ -1455,12 +1535,13 @@ ${problemReport.problems
         error: `Sorry, there was an error processing your request: ${error}`,
       });
 
-      // Clean up file uploads state on error
-      FileUploadsState.getInstance().clear(req.chatId);
       return "error";
     } finally {
       // Clean up the abort controller
       activeStreams.delete(req.chatId);
+
+      // Notify renderer that stream has ended
+      safeSend(event.sender, "chat:stream:end", { chatId: req.chatId });
 
       // Clean up any temporary files
       if (attachmentPaths.length > 0) {
@@ -1486,7 +1567,7 @@ ${problemReport.problems
   });
 
   // Handler to cancel an ongoing stream
-  ipcMain.handle("chat:cancel", async (event, chatId: number) => {
+  createTypedHandler(chatContracts.cancelStream, async (event, chatId) => {
     const abortController = activeStreams.get(chatId);
 
     if (abortController) {
@@ -1504,10 +1585,8 @@ ${problemReport.problems
       updatedFiles: false,
     } satisfies ChatResponseEnd);
 
-    // Clean up uploads state for this chat
-    try {
-      FileUploadsState.getInstance().clear(chatId);
-    } catch {}
+    // Also emit stream:end so cleanup listeners (e.g., pending agent consents) fire
+    safeSend(event.sender, "chat:stream:end", { chatId });
 
     return true;
   });

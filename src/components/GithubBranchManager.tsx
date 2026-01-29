@@ -8,7 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
 import {
   ChevronsDownUp,
   ChevronsUpDown,
@@ -21,6 +21,8 @@ import {
   Edit2,
   MoreHorizontal,
   AlertCircle,
+  GitPullRequestArrow,
+  EllipsisVertical,
 } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useSettings } from "@/hooks/useSettings";
@@ -38,7 +40,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import {
   AlertDialog,
@@ -98,6 +99,7 @@ export function GithubBranchManager({
   const [branchToMerge, setBranchToMerge] = useState<string | null>(null);
   const [isMerging, setIsMerging] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [isPulling, setIsPulling] = useState(false);
   // State for abort confirmation dialog
   const [abortConfirmation, setAbortConfirmation] = useState<{
     show: boolean;
@@ -110,10 +112,8 @@ export function GithubBranchManager({
     setIsLoading(true);
     try {
       const [localResult, remoteBranches] = await Promise.all([
-        IpcClient.getInstance().listLocalGithubBranches(appId),
-        IpcClient.getInstance()
-          .listRemoteGithubBranches(appId)
-          .catch(() => []),
+        ipc.github.listLocalBranches({ appId }),
+        ipc.github.listRemoteBranches({ appId }).catch(() => []),
       ]);
 
       // Merge local and remote branches, removing duplicates
@@ -137,11 +137,11 @@ export function GithubBranchManager({
     setIsCreating(true);
     const branchName = newBranchName.trim();
     try {
-      await IpcClient.getInstance().createGithubBranch(
+      await ipc.github.createBranch({
         appId,
-        branchName,
-        sourceBranch || undefined,
-      );
+        branch: branchName,
+        from: sourceBranch || undefined,
+      });
       showSuccess(`Branch '${branchName}' created`);
       setNewBranchName("");
       setSourceBranch(""); // Reset source branch selection
@@ -162,7 +162,7 @@ export function GithubBranchManager({
     setIsSwitching(true);
     try {
       const switchBranch = async () =>
-        await IpcClient.getInstance().switchGithubBranch(appId, branch);
+        await ipc.github.switchBranch({ appId, branch });
 
       try {
         await switchBranch();
@@ -181,7 +181,7 @@ export function GithubBranchManager({
           | undefined;
         if (!errorCode) {
           try {
-            const state = await IpcClient.getInstance().getGithubState(appId);
+            const state = await ipc.github.getGitState({ appId });
             if (state.rebaseInProgress) inferredCode = "REBASE_IN_PROGRESS";
             else if (state.mergeInProgress) inferredCode = "MERGE_IN_PROGRESS";
           } catch {
@@ -197,8 +197,7 @@ export function GithubBranchManager({
           // Check if there are unresolved conflicts
           let hasConflicts = false;
           try {
-            const conflicts =
-              await IpcClient.getInstance().getGithubMergeConflicts(appId);
+            const conflicts = await ipc.github.getConflicts({ appId });
             hasConflicts = conflicts.length > 0;
           } catch {
             // If we can't get conflicts, assume there might be conflicts to be safe
@@ -219,8 +218,7 @@ export function GithubBranchManager({
           // Check if there are unresolved conflicts
           let hasConflicts = false;
           try {
-            const conflicts =
-              await IpcClient.getInstance().getGithubMergeConflicts(appId);
+            const conflicts = await ipc.github.getConflicts({ appId });
             hasConflicts = conflicts.length > 0;
           } catch {
             // If we can't get conflicts, assume there might be conflicts to be safe
@@ -255,14 +253,14 @@ export function GithubBranchManager({
     try {
       // Abort the operation - both methods throw on error
       if (operationType === "rebase") {
-        await IpcClient.getInstance().abortGithubRebase(appId);
+        await ipc.github.rebaseAbort({ appId });
       } else {
-        await IpcClient.getInstance().abortGithubMerge(appId);
+        await ipc.github.mergeAbort({ appId });
       }
 
       // Now switch to the target branch
       try {
-        await IpcClient.getInstance().switchGithubBranch(appId, targetBranch);
+        await ipc.github.switchBranch({ appId, branch: targetBranch });
         showSuccess(
           `Aborted ongoing ${operationType} and switched to branch '${targetBranch}'`,
         );
@@ -291,7 +289,7 @@ export function GithubBranchManager({
 
     setIsDeleting(true);
     try {
-      await IpcClient.getInstance().deleteGithubBranch(appId, branchToDelete);
+      await ipc.github.deleteBranch({ appId, branch: branchToDelete });
       showSuccess(`Branch '${branchToDelete}' deleted`);
       setBranchToDelete(null);
       await loadBranches();
@@ -307,11 +305,11 @@ export function GithubBranchManager({
     setIsRenaming(true);
     try {
       const trimmedNewName = renameBranchName.trim();
-      await IpcClient.getInstance().renameGithubBranch(
+      await ipc.github.renameBranch({
         appId,
-        branchToRename,
-        trimmedNewName,
-      );
+        oldBranch: branchToRename,
+        newBranch: trimmedNewName,
+      });
       showSuccess(`Renamed '${branchToRename}' to '${trimmedNewName}'`);
       setBranchToRename(null);
       setRenameBranchName("");
@@ -328,7 +326,7 @@ export function GithubBranchManager({
     setIsMerging(true);
     setConflicts([]); // Clear conflicts when starting a new merge operation
     try {
-      await IpcClient.getInstance().mergeGithubBranch(appId, branchToMerge);
+      await ipc.github.mergeBranch({ appId, branch: branchToMerge });
       showSuccess(`Merged '${branchToMerge}' into '${currentBranch}'`);
       setConflicts([]); // Clear conflicts on successful merge
       setBranchToMerge(null);
@@ -343,8 +341,7 @@ export function GithubBranchManager({
         showInfo("Merge conflict detected. Please resolve them in the editor.");
         // Show conflicts dialog
         try {
-          const conflicts =
-            await IpcClient.getInstance().getGithubMergeConflicts(appId);
+          const conflicts = await ipc.github.getConflicts({ appId });
 
           if (conflicts.length > 0) {
             setConflicts(conflicts);
@@ -373,6 +370,19 @@ export function GithubBranchManager({
     }
   };
 
+  const handleGitPull = async () => {
+    setIsPulling(true);
+    try {
+      await ipc.github.pull({ appId });
+      showSuccess("Pulled latest changes from remote");
+      await loadBranches();
+    } catch (error: any) {
+      showError(error.message || "Failed to pull changes");
+    } finally {
+      setIsPulling(false);
+    }
+  };
+
   return (
     <div className="space-y-2">
       <div className="flex gap-2">
@@ -385,7 +395,8 @@ export function GithubBranchManager({
             isRenaming ||
             isMerging ||
             isCreating ||
-            isLoading
+            isLoading ||
+            isPulling
           }
         >
           <SelectTrigger className="w-full" data-testid="branch-select-trigger">
@@ -407,45 +418,56 @@ export function GithubBranchManager({
           </SelectContent>
         </Select>
 
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={loadBranches}
-                disabled={isLoading}
-                title="Refresh branches"
-                data-testid="refresh-branches-button"
-              >
-                <RefreshCw
-                  className={`h-4 w-4 ${isLoading ? "animate-spin" : ""}`}
-                />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Refresh branches</TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-
-        <Dialog open={showCreateDialog} onOpenChange={setShowCreateDialog}>
+        <DropdownMenu>
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
-                <DialogTrigger asChild>
+                <DropdownMenuTrigger asChild>
                   <Button
                     variant="outline"
                     size="icon"
-                    title="Create new branch"
-                    data-testid="create-branch-trigger"
+                    title="Branch actions"
+                    data-testid="branch-actions-menu-trigger"
                   >
-                    <Plus className="h-4 w-4" />
+                    <EllipsisVertical className="h-4 w-4" />
                   </Button>
-                </DialogTrigger>
+                </DropdownMenuTrigger>
               </TooltipTrigger>
-              <TooltipContent>Create new branch</TooltipContent>
+              <TooltipContent>Branch actions</TooltipContent>
             </Tooltip>
           </TooltipProvider>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              onClick={() => setShowCreateDialog(true)}
+              data-testid="create-branch-trigger"
+            >
+              <Plus className="mr-2 h-4 w-4" />
+              Create new branch
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={loadBranches}
+              disabled={isLoading}
+              data-testid="refresh-branches-button"
+            >
+              <RefreshCw
+                className={`mr-2 h-4 w-4 ${isLoading ? "animate-spin" : ""}`}
+              />
+              Refresh branches
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={handleGitPull}
+              disabled={isPulling}
+              data-testid="git-pull-button"
+            >
+              <GitPullRequestArrow
+                className={`mr-2 h-4 w-4 ${isPulling ? "animate-spin" : ""}`}
+              />
+              Git pull
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
 
+        <Dialog open={showCreateDialog} onOpenChange={setShowCreateDialog}>
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Create New Branch</DialogTitle>

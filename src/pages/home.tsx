@@ -2,13 +2,13 @@ import { useNavigate, useSearch } from "@tanstack/react-router";
 import { useAtom, useSetAtom } from "jotai";
 import { homeChatInputValueAtom } from "../atoms/chatAtoms";
 import { selectedAppIdAtom } from "@/atoms/appAtoms";
-import { IpcClient } from "@/ipc/ipc_client";
+import { ipc } from "@/ipc/types";
 import { generateCuteAppName } from "@/lib/utils";
 import { useLoadApps } from "@/hooks/useLoadApps";
 import { useSettings } from "@/hooks/useSettings";
 import { SetupBanner } from "@/components/SetupBanner";
 import { isPreviewOpenAtom } from "@/atoms/viewAtoms";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useStreamChat } from "@/hooks/useStreamChat";
 import { HomeChatInput } from "@/components/chat/HomeChatInput";
 import { usePostHog } from "posthog-js/react";
@@ -31,7 +31,7 @@ import { invalidateAppQuery } from "@/hooks/useLoadApp";
 import { useQueryClient } from "@tanstack/react-query";
 import { ForceCloseDialog } from "@/components/ForceCloseDialog";
 
-import type { FileAttachment } from "@/ipc/ipc_types";
+import type { FileAttachment } from "@/ipc/types";
 import { NEON_TEMPLATE_IDS } from "@/shared/templates";
 import { neonTemplateHook } from "@/client_logic/template_hook";
 import {
@@ -39,7 +39,8 @@ import {
   ManageDyadProButton,
   SetupDyadProButton,
 } from "@/components/ProBanner";
-import { hasDyadProKey } from "@/lib/schemas";
+import { hasDyadProKey, getEffectiveDefaultChatMode } from "@/lib/schemas";
+import { useFreeAgentQuota } from "@/hooks/useFreeAgentQuota";
 
 // Adding an export for attachments
 export interface HomeSubmitOptions {
@@ -52,7 +53,8 @@ export default function HomePage() {
   const search = useSearch({ from: "/" });
   const setSelectedAppId = useSetAtom(selectedAppIdAtom);
   const { refreshApps } = useLoadApps();
-  const { settings, updateSettings } = useSettings();
+  const { settings, updateSettings, envVars } = useSettings();
+  const { isQuotaExceeded, isLoading: isQuotaLoading } = useFreeAgentQuota();
 
   const setIsPreviewOpen = useSetAtom(isPreviewOpenAtom);
   const [isLoading, setIsLoading] = useState(false);
@@ -68,8 +70,7 @@ export default function HomePage() {
 
   // Listen for force-close events
   useEffect(() => {
-    const ipc = IpcClient.getInstance();
-    const unsubscribe = ipc.onForceCloseDetected((data) => {
+    const unsubscribe = ipc.events.system.onForceCloseDetected((data) => {
       setPerformanceData(data.performanceData);
       setForceCloseDialogOpen(true);
     });
@@ -94,7 +95,7 @@ export default function HomePage() {
         }
 
         try {
-          const result = await IpcClient.getInstance().doesReleaseNoteExist({
+          const result = await ipc.system.doesReleaseNoteExist({
             version: appVersion,
           });
 
@@ -139,6 +140,24 @@ export default function HomePage() {
     }
   }, [appId, navigate]);
 
+  // Apply default chat mode when navigating to home page
+  // Wait for quota status to load to avoid race condition where we default to Basic Agent
+  // before knowing if quota is actually exceeded
+  const hasAppliedDefaultChatMode = useRef(false);
+  useEffect(() => {
+    if (settings && !hasAppliedDefaultChatMode.current && !isQuotaLoading) {
+      hasAppliedDefaultChatMode.current = true;
+      const effectiveDefaultMode = getEffectiveDefaultChatMode(
+        settings,
+        envVars,
+        !isQuotaExceeded,
+      );
+      if (settings.selectedChatMode !== effectiveDefaultMode) {
+        updateSettings({ selectedChatMode: effectiveDefaultMode });
+      }
+    }
+  }, [settings, updateSettings, isQuotaExceeded, isQuotaLoading, envVars]);
+
   const handleSubmit = async (options?: HomeSubmitOptions) => {
     const attachments = options?.attachments || [];
 
@@ -147,7 +166,7 @@ export default function HomePage() {
     try {
       setIsLoading(true);
       // Create the chat and navigate
-      const result = await IpcClient.getInstance().createApp({
+      const result = await ipc.app.createApp({
         name: generateCuteAppName(),
       });
       if (
@@ -162,7 +181,7 @@ export default function HomePage() {
 
       // Apply selected theme to the new app (if one is set)
       if (settings?.selectedThemeId) {
-        await IpcClient.getInstance().setAppTheme({
+        await ipc.template.setAppTheme({
           appId: result.app.id,
           themeId: settings.selectedThemeId || null,
         });

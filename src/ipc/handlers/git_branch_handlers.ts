@@ -1,8 +1,9 @@
-import { ipcMain, IpcMainInvokeEvent } from "electron";
+import { IpcMainInvokeEvent } from "electron";
 import { readSettings } from "../../main/settings";
 import {
   gitMergeAbort,
   gitFetch,
+  gitPull,
   gitCreateBranch,
   gitDeleteBranch,
   gitCheckout,
@@ -15,6 +16,9 @@ import {
   GIT_ERROR_CODES,
   isGitMergeInProgress,
   isGitRebaseInProgress,
+  getGitUncommittedFilesWithStatus,
+  gitAddAll,
+  gitCommit,
 } from "../utils/git_utils";
 import { getDyadAppPath } from "../../paths/paths";
 import { db } from "../../db";
@@ -23,12 +27,21 @@ import { eq } from "drizzle-orm";
 import log from "electron-log";
 import { withLock } from "../utils/lock_utils";
 import { updateAppGithubRepo, ensureCleanWorkspace } from "./github_handlers";
+import { createTypedHandler } from "./base";
+import { githubContracts, gitContracts } from "../types/github";
+import type {
+  GitBranchAppIdParams,
+  CreateGitBranchParams,
+  GitBranchParams,
+  RenameGitBranchParams,
+  UncommittedFile,
+} from "../types/github";
 
 const logger = log.scope("git_branch_handlers");
 
 async function handleAbortMerge(
   event: IpcMainInvokeEvent,
-  { appId }: { appId: number },
+  { appId }: GitBranchAppIdParams,
 ): Promise<void> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
@@ -40,7 +53,7 @@ async function handleAbortMerge(
 // --- GitHub Fetch Handler ---
 async function handleFetchFromGithub(
   event: IpcMainInvokeEvent,
-  { appId }: { appId: number },
+  { appId }: GitBranchAppIdParams,
 ): Promise<void> {
   const settings = readSettings();
   const accessToken = settings.githubAccessToken?.value;
@@ -63,7 +76,7 @@ async function handleFetchFromGithub(
 // --- GitHub Branch Handlers ---
 async function handleCreateBranch(
   event: IpcMainInvokeEvent,
-  { appId, branch, from }: { appId: number; branch: string; from?: string },
+  { appId, branch, from }: CreateGitBranchParams,
 ): Promise<void> {
   // Validate branch name
   if (!branch || branch.length === 0 || branch.length > 255) {
@@ -96,7 +109,7 @@ async function handleCreateBranch(
 
 async function handleDeleteBranch(
   event: IpcMainInvokeEvent,
-  { appId, branch }: { appId: number; branch: string },
+  { appId, branch }: GitBranchParams,
 ): Promise<void> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
@@ -110,7 +123,7 @@ async function handleDeleteBranch(
 
 async function handleSwitchBranch(
   event: IpcMainInvokeEvent,
-  { appId, branch }: { appId: number; branch: string },
+  { appId, branch }: GitBranchParams,
 ): Promise<void> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
@@ -169,11 +182,7 @@ async function handleSwitchBranch(
 
 async function handleRenameBranch(
   event: IpcMainInvokeEvent,
-  {
-    appId,
-    oldBranch,
-    newBranch,
-  }: { appId: number; oldBranch: string; newBranch: string },
+  { appId, oldBranch, newBranch }: RenameGitBranchParams,
 ): Promise<void> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
@@ -211,7 +220,7 @@ class MergeConflictError extends Error {
 
 async function handleMergeBranch(
   event: IpcMainInvokeEvent,
-  { appId, branch }: { appId: number; branch: string },
+  { appId, branch }: GitBranchParams,
 ): Promise<void> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
@@ -272,7 +281,7 @@ async function handleMergeBranch(
 
 async function handleListLocalBranches(
   event: IpcMainInvokeEvent,
-  { appId }: { appId: number },
+  { appId }: GitBranchAppIdParams,
 ): Promise<{ branches: string[]; current: string | null }> {
   const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
   if (!app) throw new Error("App not found");
@@ -295,15 +304,120 @@ async function handleListRemoteBranches(
   return branches;
 }
 
+async function handleGetUncommittedFiles(
+  event: IpcMainInvokeEvent,
+  { appId }: GitBranchAppIdParams,
+): Promise<UncommittedFile[]> {
+  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
+  if (!app) throw new Error("App not found");
+  const appPath = getDyadAppPath(app.path);
+
+  return getGitUncommittedFilesWithStatus({ path: appPath });
+}
+
+async function handleCommitChanges(
+  event: IpcMainInvokeEvent,
+  { appId, message }: { appId: number; message: string },
+): Promise<string> {
+  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
+  if (!app) throw new Error("App not found");
+  const appPath = getDyadAppPath(app.path);
+
+  return withLock(appId, async () => {
+    // Check for merge or rebase in progress
+    if (isGitMergeInProgress({ path: appPath })) {
+      throw GitStateError(
+        "Cannot commit: merge in progress. Please complete or abort the merge first.",
+        GIT_ERROR_CODES.MERGE_IN_PROGRESS,
+      );
+    }
+
+    if (isGitRebaseInProgress({ path: appPath })) {
+      throw GitStateError(
+        "Cannot commit: rebase in progress. Please complete or abort the rebase first.",
+        GIT_ERROR_CODES.REBASE_IN_PROGRESS,
+      );
+    }
+
+    // Stage all changes
+    await gitAddAll({ path: appPath });
+
+    // Commit with the provided message
+    const commitHash = await gitCommit({ path: appPath, message });
+
+    return commitHash;
+  });
+}
+
+// --- GitHub Pull Handler ---
+async function handlePullFromGithub(
+  event: IpcMainInvokeEvent,
+  { appId }: GitBranchAppIdParams,
+): Promise<void> {
+  const settings = readSettings();
+  const accessToken = settings.githubAccessToken?.value;
+  if (!accessToken) {
+    throw new Error("Not authenticated with GitHub.");
+  }
+  const app = await db.query.apps.findFirst({ where: eq(apps.id, appId) });
+  if (!app || !app.githubOrg || !app.githubRepo) {
+    throw new Error("App is not linked to a GitHub repo.");
+  }
+  const appPath = getDyadAppPath(app.path);
+  const currentBranch = await gitCurrentBranch({ path: appPath });
+
+  try {
+    await gitPull({
+      path: appPath,
+      remote: "origin",
+      branch: currentBranch || "main",
+      accessToken,
+    });
+  } catch (pullError: any) {
+    // Check if it's a missing remote branch error
+    const errorMessage = pullError?.message || "";
+    const isMissingRemoteBranch =
+      pullError?.code === "MissingRefError" ||
+      (pullError?.code === "NotFoundError" &&
+        (errorMessage.includes("remote ref") ||
+          errorMessage.includes("remote branch"))) ||
+      errorMessage.includes("couldn't find remote ref") ||
+      errorMessage.includes("Cannot read properties of null");
+
+    // If the remote branch doesn't exist yet, we can ignore this
+    // (e.g., user hasn't pushed the branch yet)
+    if (!isMissingRemoteBranch) {
+      throw pullError;
+    } else {
+      logger.debug(
+        "[GitHub Handler] Remote branch missing during pull, continuing",
+        errorMessage,
+      );
+    }
+  }
+}
+
 // --- Registration ---
 export function registerGithubBranchHandlers() {
-  ipcMain.handle("github:merge-abort", handleAbortMerge);
-  ipcMain.handle("github:fetch", handleFetchFromGithub);
-  ipcMain.handle("github:create-branch", handleCreateBranch);
-  ipcMain.handle("github:delete-branch", handleDeleteBranch);
-  ipcMain.handle("github:switch-branch", handleSwitchBranch);
-  ipcMain.handle("github:rename-branch", handleRenameBranch);
-  ipcMain.handle("github:merge-branch", handleMergeBranch);
-  ipcMain.handle("github:list-local-branches", handleListLocalBranches);
-  ipcMain.handle("github:list-remote-branches", handleListRemoteBranches);
+  createTypedHandler(githubContracts.mergeAbort, handleAbortMerge);
+  createTypedHandler(githubContracts.fetch, handleFetchFromGithub);
+  createTypedHandler(githubContracts.pull, handlePullFromGithub);
+  createTypedHandler(githubContracts.createBranch, handleCreateBranch);
+  createTypedHandler(githubContracts.deleteBranch, handleDeleteBranch);
+  createTypedHandler(githubContracts.switchBranch, handleSwitchBranch);
+  createTypedHandler(githubContracts.renameBranch, handleRenameBranch);
+  createTypedHandler(githubContracts.mergeBranch, handleMergeBranch);
+  createTypedHandler(
+    githubContracts.listLocalBranches,
+    handleListLocalBranches,
+  );
+  createTypedHandler(
+    githubContracts.listRemoteBranches,
+    handleListRemoteBranches,
+  );
+  createTypedHandler(
+    gitContracts.getUncommittedFiles,
+    handleGetUncommittedFiles,
+  );
+  createTypedHandler(gitContracts.commitChanges, handleCommitChanges);
 }

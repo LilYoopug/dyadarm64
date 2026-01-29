@@ -2,7 +2,7 @@ import fetch from "node-fetch"; // Electron main process might need node-fetch
 import log from "electron-log";
 import { createLoggedHandler } from "./safe_handle";
 import { readSettings } from "../../main/settings"; // Assuming settings are read this way
-import { UserBudgetInfo, UserBudgetInfoSchema } from "../ipc_types";
+import { UserBudgetInfo, UserBudgetInfoSchema } from "@/ipc/types";
 import { IS_TEST_BUILD } from "../utils/test_utils";
 import { z } from "zod";
 
@@ -11,6 +11,7 @@ export const UserInfoResponseSchema = z.object({
   totalCredits: z.number(),
   budgetResetDate: z.string(), // ISO date string from API
   userId: z.string(),
+  isTrial: z.boolean().optional().default(false),
 });
 export type UserInfoResponse = z.infer<typeof UserInfoResponseSchema>;
 
@@ -30,6 +31,7 @@ export function registerProHandlers() {
         totalCredits: 1000,
         budgetResetDate: resetDate,
         redactedUserId: "<redacted-user-id-testing>",
+        isTrial: false,
       };
     }
     logger.info("Attempting to fetch user budget information.");
@@ -83,6 +85,7 @@ export function registerProHandlers() {
         totalCredits: data.totalCredits,
         budgetResetDate: new Date(data.budgetResetDate),
         redactedUserId: redactedUserId,
+        isTrial: data.isTrial,
       });
 
       return userBudgetInfo;
